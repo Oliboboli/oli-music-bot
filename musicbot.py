@@ -206,28 +206,63 @@ class MusicBot(BaseBot):
             self.current = None
 
     async def _stream_song(self, song: dict):
-        """Download audio and PUT to relay."""
+        """Download audio via yt-dlp, transcode with FFmpeg, PUT MP3 to relay."""
+        url = song["url"]
+        title = song.get("title", "unknown")
+        print(f"[audio] starting: {title}", flush=True)
+        print(f"[audio] url: {url}", flush=True)
         try:
-            proc = await asyncio.create_subprocess_exec(
+            # yt-dlp: bestaudio to stdout
+            ytdlp = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "yt_dlp",
                 "--no-playlist", "--quiet", "--no-warnings",
-                "-f", "bestaudio", "--audio-format", "mp3", "--audio-quality", "128K",
-                "-o", "-", song["url"],
+                "-f", "bestaudio",
+                "-o", "-", url,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
+            # FFmpeg: transcode to 128k MP3 on stdout
+            ffmpeg = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-i", "pipe:0",
+                "-vn", "-c:a", "libmp3lame", "-b:a", "128k",
+                "-f", "mp3", "pipe:1",
+                stdin=ytdlp.stdout,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            # release ytdlp.stdout so FFmpeg owns it
+            if ytdlp.stdout:
+                ytdlp.stdout.close()
+
             import aiohttp
+            uploaded = 0
             async with aiohttp.ClientSession() as session:
                 async with session.put(
                     RELAY_URL,
-                    data=proc.stdout,
+                    data=ffmpeg.stdout,
                     headers={"Content-Type": "audio/mpeg"},
-                    timeout=aiohttp.ClientTimeout(total=song.get("duration", 180) + 30),
-                ):
-                    pass
-            await proc.wait()
+                    timeout=aiohttp.ClientTimeout(total=song.get("duration", 180) + 60),
+                ) as resp:
+                    print(f"[audio] relay PUT status: {resp.status}", flush=True)
+                    # read response to complete the request
+                    await resp.read()
+
+            # wait for processes, log results
+            ytdlp_rc = await ytdlp.wait()
+            ffmpeg_stderr = await ffmpeg.stderr.read() if ffmpeg.stderr else b""
+            ffmpeg_rc = await ffmpeg.wait()
+            print(f"[audio] yt-dlp rc={ytdlp_rc}, ffmpeg rc={ffmpeg_rc}", flush=True)
+            if ffmpeg_stderr:
+                print(f"[audio] ffmpeg stderr: {ffmpeg_stderr.decode()[:500]}", flush=True)
+            if ffmpeg_rc != 0:
+                print(f"[audio] FAILED to transcode: {title}", flush=True)
+            else:
+                print(f"[audio] done: {title}", flush=True)
         except Exception as e:
-            print(f"Stream error: {e}", flush=True)
+            print(f"[audio] stream error for {title}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
 
 async def main():
