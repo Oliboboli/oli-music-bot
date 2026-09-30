@@ -26,10 +26,9 @@ ROOM_ID = os.environ.get("ROOM_ID", "6a7537ddf1acd9746a2593bb")
 RELAY_URL = os.environ.get("RELAY_URL", "https://responsible-vision-production-9695.up.railway.app/stream")
 OLI_ID = "67a4b9fcaa2fc29f791c24f5"
 
-# Teleports — DJ spot hardcoded (Railway filesystem is ephemeral, so
-# !settele only lasts until redeploy; DJ default is baked in)
-TELEPORTS = {
-    "dj": {"x": 11.142864227295, "y": 0.25, "z": 29.183265686035, "facing": "FrontRight"},
+# Local MP3s (in repo) — bypass YouTube entirely
+LOCAL_SONGS = {
+    "hole dwelling": "hole-dwelling.mp3",
 }
 
 # Playlist — copied from local
@@ -133,14 +132,18 @@ class MusicBot(BaseBot):
             await self._cmd_skip(user)
         elif low == "!stop":
             await self._cmd_stop(user)
-        elif low.startswith("!settele "):
-            name = msg[9:].strip().lower()
-            if name:
-                await self._cmd_settele(user, name)
-        elif low in TELEPORTS:
-            await self._cmd_goto(user, low)
 
     async def _cmd_play(self, user: User, query: str):
+        # Check local MP3s first (bypasses YouTube)
+        qlow = query.lower().strip()
+        for key, filename in LOCAL_SONGS.items():
+            if key in qlow or qlow in key:
+                song = {"title": key.title(), "local_file": filename, "url": ""}
+                self.queue.append(song)
+                await self.highrise.send_whisper(user.id, f"queued: {song['title']}")
+                if not self.playing:
+                    asyncio.create_task(self._play_loop())
+                return
         song = find_song(query)
         if not song:
             # fallback to live search (likely blocked on Railway, but try)
@@ -202,43 +205,6 @@ class MusicBot(BaseBot):
         self.playing = False
         await self.highrise.chat("⏹ stopped")
 
-    async def _cmd_settele(self, user: User, name: str):
-        # oli-only: save your current spot as a teleport
-        if user.id != OLI_ID:
-            await self.highrise.send_whisper(user.id, "only oli can set teleports")
-            return
-        try:
-            resp = await self.highrise.get_room_users()
-            if hasattr(resp, 'content'):
-                for room_user, pos in resp.content:
-                    if room_user.id == user.id:
-                        TELEPORTS[name] = {
-                            "x": pos.x, "y": pos.y, "z": pos.z,
-                            "facing": getattr(pos, 'facing', 'FrontRight')
-                        }
-                        await self.highrise.send_whisper(user.id, f"saved '{name}'!")
-                        return
-            await self.highrise.send_whisper(user.id, "couldn't find ur position")
-        except Exception as e:
-            await self.highrise.send_whisper(user.id, f"failed: {e}")
-
-    async def _cmd_goto(self, user: User, name: str):
-        # teleport user to a saved spot (e.g. "dj")
-        spot = TELEPORTS.get(name)
-        if not spot:
-            return
-        try:
-            from highrise.models import Position
-            await self.highrise.teleport(
-                user.id,
-                Position(
-                    x=spot["x"], y=spot["y"], z=spot["z"],
-                    facing=spot.get("facing", "FrontRight")
-                )
-            )
-        except Exception:
-            pass
-
     async def _play_loop(self):
         if self.playing:
             return
@@ -255,10 +221,39 @@ class MusicBot(BaseBot):
             self.current = None
 
     async def _stream_song(self, song: dict):
-        """Download audio via yt-dlp, transcode with FFmpeg, PUT MP3 to relay."""
-        url = song["url"]
+        """Stream audio to relay. Uses local MP3 if available, else yt-dlp + FFmpeg."""
         title = song.get("title", "unknown")
         print(f"[audio] starting: {title}", flush=True)
+
+        # Check for local MP3 file first (bypasses YouTube entirely)
+        local_file = song.get("local_file")
+        if local_file:
+            import os
+            filepath = os.path.join(os.path.dirname(__file__), local_file)
+            if os.path.exists(filepath):
+                print(f"[audio] using local file: {filepath}", flush=True)
+                try:
+                    with open(filepath, "rb") as f:
+                        mp3_data = f.read()
+                    print(f"[audio] read {len(mp3_data)} bytes from local file", flush=True)
+                    # PUT directly to relay (already MP3, no transcoding needed)
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.put(
+                            RELAY_URL,
+                            data=mp3_data,
+                            headers={"Content-Type": "audio/mpeg"}
+                        ) as resp:
+                            print(f"[audio] relay PUT status: {resp.status}", flush=True)
+                    return
+                except Exception as e:
+                    print(f"[audio] local file error: {e}", flush=True)
+                    # fall through to yt-dlp
+            else:
+                print(f"[audio] local file not found: {filepath}", flush=True)
+
+        # Fallback: Download via yt-dlp (YouTube)
+        url = song["url"]
         print(f"[audio] url: {url}", flush=True)
         try:
             # Get FFmpeg binary path (from imageio-ffmpeg package, works without system ffmpeg)
