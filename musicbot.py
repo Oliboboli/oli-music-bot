@@ -212,6 +212,15 @@ class MusicBot(BaseBot):
         print(f"[audio] starting: {title}", flush=True)
         print(f"[audio] url: {url}", flush=True)
         try:
+            # Get FFmpeg binary path (from imageio-ffmpeg package, works without system ffmpeg)
+            try:
+                import imageio_ffmpeg
+                ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+                print(f"[audio] using ffmpeg: {ffmpeg_bin}", flush=True)
+            except Exception as e:
+                print(f"[audio] imageio-ffmpeg not available, trying system ffmpeg: {e}", flush=True)
+                ffmpeg_bin = "ffmpeg"
+
             # yt-dlp: bestaudio to stdout (as PIPE)
             ytdlp = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "yt_dlp",
@@ -223,7 +232,7 @@ class MusicBot(BaseBot):
             )
             # FFmpeg: transcode to 128k MP3, stdin as PIPE (we'll pump data manually)
             ffmpeg = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                ffmpeg_bin, "-hide_banner", "-loglevel", "error",
                 "-i", "pipe:0",
                 "-vn", "-c:a", "libmp3lame", "-b:a", "128k",
                 "-f", "mp3", "pipe:1",
