@@ -30,6 +30,36 @@ OLI_ID = "67a4b9fcaa2fc29f791c24f5"
 with open(BOT_DIR / "playlist.json") as f:
     PLAYLIST = json.load(f)
 
+# Pre-resolved YouTube URLs (YouTube blocks Railway's IP for searches,
+# so we resolve them here where it works and ship the URLs with the bot)
+try:
+    with open(BOT_DIR / "song_urls.json") as f:
+        SONG_URLS = json.load(f)
+except FileNotFoundError:
+    SONG_URLS = {}
+
+
+def find_song(query: str) -> dict | None:
+    """Find a song by name/artist in the pre-resolved URL map.
+    Matches if the query words are all found in the song key."""
+    q = query.lower().strip()
+    if not q:
+        return None
+    qwords = q.split()
+    # exact key match first
+    if q in SONG_URLS:
+        return SONG_URLS[q]
+    # word-subset match: all query words appear in the key
+    best = None
+    best_len = 999
+    for key, song in SONG_URLS.items():
+        if all(w in key for w in qwords):
+            # prefer the shortest (most specific) match
+            if len(key) < best_len:
+                best = song
+                best_len = len(key)
+    return best
+
 
 async def yt_search(query: str) -> dict | None:
     """Search YouTube via yt-dlp. No proxy needed on Railway."""
@@ -43,6 +73,9 @@ async def yt_search(query: str) -> dict | None:
                  "--default-search", "ytsearch1", query],
                 capture_output=True, text=True, timeout=35,
             )
+            print(f"yt-dlp search for '{query}': returncode={r.returncode}", flush=True)
+            print(f"yt-dlp stdout: {r.stdout[:500]}", flush=True)
+            print(f"yt-dlp stderr: {r.stderr[:500]}", flush=True)
             line = r.stdout.strip().split("\n")[-1] if r.stdout.strip() else ""
             if line and r.returncode == 0:
                 parts = line.split("\t")
@@ -52,12 +85,14 @@ async def yt_search(query: str) -> dict | None:
                     except ValueError:
                         dur = 180
                     return {"title": parts[0], "url": parts[2], "duration": dur}
-        except Exception:
-            pass
+            print(f"Search failed for '{query}': no valid result", flush=True)
+        except Exception as e:
+            print(f"Search exception for '{query}': {e}", flush=True)
         return None
     try:
         return await asyncio.to_thread(_search)
-    except Exception:
+    except Exception as e:
+        print(f"Search thread exception: {e}", flush=True)
         return None
 
 
@@ -91,7 +126,10 @@ class MusicBot(BaseBot):
             await self._cmd_stop(user)
 
     async def _cmd_play(self, user: User, query: str):
-        song = await yt_search(query)
+        song = find_song(query)
+        if not song:
+            # fallback to live search (likely blocked on Railway, but try)
+            song = await yt_search(query)
         if not song:
             await self.highrise.send_whisper(user.id, "couldn't find that song 😢")
             return
@@ -109,7 +147,9 @@ class MusicBot(BaseBot):
         track = random.choice(PLAYLIST)
         query = f"{track.get('title', '')} {track.get('artist', '')}".strip()
         await self.highrise.chat(f"🎲 playlist pick: {track.get('title')} — {track.get('artist')}")
-        song = await yt_search(query)
+        song = find_song(query)
+        if not song:
+            song = await yt_search(query)
         if not song:
             await self.highrise.send_whisper(user.id, "couldn't find that song 😢")
             return
