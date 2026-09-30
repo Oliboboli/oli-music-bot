@@ -5,6 +5,7 @@ Python auto-imports this module at startup (sitecustomize), restoring
 those methods so musicbot.py works unchanged. Also forces
 line-buffered stdout so bot logs appear promptly.
 """
+print("SITECUSTOMIZE LOADED", flush=True)
 import sys
 
 try:
@@ -29,5 +30,5 @@ try:
             return None
 
         Highrise.join_room = _join_room
-except Exception:
-    pass
+except Exception as e:
+    print(f"SITECUSTOMIZE PATCH FAILED: {e}", flush=True)
