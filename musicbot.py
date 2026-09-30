@@ -26,6 +26,12 @@ ROOM_ID = os.environ.get("ROOM_ID", "6a7537ddf1acd9746a2593bb")
 RELAY_URL = os.environ.get("RELAY_URL", "https://responsible-vision-production-9695.up.railway.app/stream")
 OLI_ID = "67a4b9fcaa2fc29f791c24f5"
 
+# Teleports — DJ spot hardcoded (Railway filesystem is ephemeral, so
+# !settele only lasts until redeploy; DJ default is baked in)
+TELEPORTS = {
+    "dj": {"x": 11.142864227295, "y": 0.25, "z": 29.183265686035, "facing": "FrontRight"},
+}
+
 # Playlist — copied from local
 with open(BOT_DIR / "playlist.json") as f:
     PLAYLIST = json.load(f)
@@ -127,6 +133,12 @@ class MusicBot(BaseBot):
             await self._cmd_skip(user)
         elif low == "!stop":
             await self._cmd_stop(user)
+        elif low.startswith("!settele "):
+            name = msg[9:].strip().lower()
+            if name:
+                await self._cmd_settele(user, name)
+        elif low in TELEPORTS:
+            await self._cmd_goto(user, low)
 
     async def _cmd_play(self, user: User, query: str):
         song = find_song(query)
@@ -189,6 +201,43 @@ class MusicBot(BaseBot):
         self.current = None
         self.playing = False
         await self.highrise.chat("⏹ stopped")
+
+    async def _cmd_settele(self, user: User, name: str):
+        # oli-only: save your current spot as a teleport
+        if user.id != OLI_ID:
+            await self.highrise.send_whisper(user.id, "only oli can set teleports")
+            return
+        try:
+            resp = await self.highrise.get_room_users()
+            if hasattr(resp, 'content'):
+                for room_user, pos in resp.content:
+                    if room_user.id == user.id:
+                        TELEPORTS[name] = {
+                            "x": pos.x, "y": pos.y, "z": pos.z,
+                            "facing": getattr(pos, 'facing', 'FrontRight')
+                        }
+                        await self.highrise.send_whisper(user.id, f"saved '{name}'!")
+                        return
+            await self.highrise.send_whisper(user.id, "couldn't find ur position")
+        except Exception as e:
+            await self.highrise.send_whisper(user.id, f"failed: {e}")
+
+    async def _cmd_goto(self, user: User, name: str):
+        # teleport user to a saved spot (e.g. "dj")
+        spot = TELEPORTS.get(name)
+        if not spot:
+            return
+        try:
+            from highrise.models import Position
+            await self.highrise.teleport(
+                user.id,
+                Position(
+                    x=spot["x"], y=spot["y"], z=spot["z"],
+                    facing=spot.get("facing", "FrontRight")
+                )
+            )
+        except Exception:
+            pass
 
     async def _play_loop(self):
         if self.playing:
