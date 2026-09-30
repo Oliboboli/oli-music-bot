@@ -222,9 +222,11 @@ class MusicBot(BaseBot):
                 ffmpeg_bin = "ffmpeg"
 
             # yt-dlp: bestaudio to stdout (as PIPE)
+            # Use android client to bypass datacenter IP blocks
             ytdlp = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "yt_dlp",
                 "--no-playlist", "--quiet", "--no-warnings",
+                "--extractor-args", "youtube:player_client=android",
                 "-f", "bestaudio",
                 "-o", "-", url,
                 stdout=asyncio.subprocess.PIPE,
