@@ -193,11 +193,26 @@ class MusicBot(BaseBot):
             await self.highrise.send_whisper(user.id, "nothing playing")
 
     async def _cmd_skip(self, user: User):
-        # TODO: check mod — for now allow all
-        if self.current:
+        # Clear relay buffer to stop current audio
+        try:
+            import aiohttp
+            clear_url = RELAY_URL.replace('/stream', '/clear')
+            async with aiohttp.ClientSession() as session:
+                async with session.post(clear_url) as resp:
+                    pass
+        except Exception:
+            pass
+        
+        self.current = None
+        # Signal the play loop to move to next song
+        if hasattr(self, '_skip_event'):
+            self._skip_event.set()
+        
+        if self.queue:
             await self.highrise.chat("⏭ skipped")
-            # The _play_loop will pick up next; we just clear current
-            self.current = None
+        else:
+            await self.highrise.chat("⏭ skipped - queue empty")
+            self.playing = False
 
     async def _cmd_stop(self, user: User):
         self.queue.clear()
@@ -209,13 +224,24 @@ class MusicBot(BaseBot):
         if self.playing:
             return
         self.playing = True
+        self._skip_event = asyncio.Event()
         try:
             while self.queue:
                 song = self.queue.popleft()
                 self.current = song
+                self._skip_event.clear()
                 await self.highrise.chat(f"🎵 now playing: {song['title']}")
-                await self._stream_song(song)
+                duration = await self._stream_song(song)
                 self.current = None
+                # Wait for song to finish, or skip
+                if duration and duration > 0:
+                    try:
+                        await asyncio.wait_for(self._skip_event.wait(), timeout=duration)
+                        # Skipped - continue to next song
+                        continue
+                    except asyncio.TimeoutError:
+                        # Song finished naturally
+                        pass
         finally:
             self.playing = False
             self.current = None
@@ -244,6 +270,9 @@ class MusicBot(BaseBot):
                     with open(filepath, "rb") as f:
                         mp3_data = f.read()
                     print(f"[audio] read {len(mp3_data)} bytes from local file", flush=True)
+                    # Estimate duration: assume 192kbps (file_size * 8 / bitrate)
+                    duration = (len(mp3_data) * 8) / (192 * 1000)
+                    print(f"[audio] estimated duration: {duration:.1f}s", flush=True)
                     # PUT directly to relay (already MP3, no transcoding needed)
                     import aiohttp
                     async with aiohttp.ClientSession() as session:
@@ -255,7 +284,7 @@ class MusicBot(BaseBot):
                             print(f"[audio] relay PUT status: {resp.status}", flush=True)
                             if resp.status != 200:
                                 await _whisper_err(f"relay returned {resp.status}")
-                    return
+                    return duration
                 except Exception as e:
                     print(f"[audio] local file error: {e}", flush=True)
                     await _whisper_err(f"local file failed: {e}")
