@@ -41,7 +41,7 @@ except FileNotFoundError:
 
 def find_song(query: str) -> dict | None:
     """Find a song by name/artist in the pre-resolved URL map.
-    Matches if the query words are all found in the song key."""
+    Lenient matching: scores by how many query words appear in the key."""
     q = query.lower().strip()
     if not q:
         return None
@@ -49,14 +49,17 @@ def find_song(query: str) -> dict | None:
     # exact key match first
     if q in SONG_URLS:
         return SONG_URLS[q]
-    # word-subset match: all query words appear in the key
+    # score each key by matched words, prefer shortest key among best scores
     best = None
-    best_len = 999
+    best_score = 0
+    best_len = 999999
     for key, song in SONG_URLS.items():
-        if all(w in key for w in qwords):
-            # prefer the shortest (most specific) match
-            if len(key) < best_len:
+        score = sum(1 for w in qwords if w in key)
+        if score > best_score or (score == best_score and score > 0 and len(key) < best_len):
+            # require at least half the words to match (rounded up)
+            if score >= (len(qwords) + 1) // 2:
                 best = song
+                best_score = score
                 best_len = len(key)
     return best
 
