@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["ffmpeg", "python311"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python -c \"import sitecustomize, runpy; runpy.run_path('musicbot.py', run_name='__main__')\""
