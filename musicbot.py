@@ -138,7 +138,7 @@ class MusicBot(BaseBot):
         qlow = query.lower().strip()
         for key, filename in LOCAL_SONGS.items():
             if key in qlow or qlow in key:
-                song = {"title": key.title(), "local_file": filename, "url": ""}
+                song = {"title": key.title(), "local_file": filename, "url": "", "requested_by": user.id}
                 self.queue.append(song)
                 await self.highrise.send_whisper(user.id, f"queued: {song['title']}")
                 if not self.playing:
@@ -223,7 +223,15 @@ class MusicBot(BaseBot):
     async def _stream_song(self, song: dict):
         """Stream audio to relay. Uses local MP3 if available, else yt-dlp + FFmpeg."""
         title = song.get("title", "unknown")
+        requested_by = song.get("requested_by")
         print(f"[audio] starting: {title}", flush=True)
+
+        async def _whisper_err(msg: str):
+            if requested_by:
+                try:
+                    await self.highrise.send_whisper(requested_by, f"audio error: {msg}")
+                except Exception:
+                    pass
 
         # Check for local MP3 file first (bypasses YouTube entirely)
         local_file = song.get("local_file")
@@ -245,12 +253,16 @@ class MusicBot(BaseBot):
                             headers={"Content-Type": "audio/mpeg"}
                         ) as resp:
                             print(f"[audio] relay PUT status: {resp.status}", flush=True)
+                            if resp.status != 200:
+                                await _whisper_err(f"relay returned {resp.status}")
                     return
                 except Exception as e:
                     print(f"[audio] local file error: {e}", flush=True)
+                    await _whisper_err(f"local file failed: {e}")
                     # fall through to yt-dlp
             else:
                 print(f"[audio] local file not found: {filepath}", flush=True)
+                await _whisper_err(f"file not found on server: {local_file}")
 
         # Fallback: Download via yt-dlp (YouTube)
         url = song["url"]
