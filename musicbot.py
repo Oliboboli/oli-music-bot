@@ -121,9 +121,47 @@ class MusicBot(BaseBot):
         self.current = None
         self.playing = False
 
+    # DJ bot dance emotes — always dancing, cycling through, music on or not
+    # (emote_id, duration_seconds)
+    DANCE_EMOTES = [
+        ("emote-tapdance", 11.1),
+        ("dance-tiktok8", 10.2),
+        ("dance-russian", 9.6),
+    ("dance-orangejustice", 6.5),
+    ("dance-blackpink", 6.4),
+    ("dance-zombie", 12.9),
+    ("dance-tiktok9", 11.5),
+    ("idle-dance-casual", 8.8),
+    ("dance-icecream", 6.3),
+    ("dance-tiktok10", 7.5),
+    ("dance-sexy", 12.3),
+    ("dance-pinguin", 10.8),
+]
+
     async def on_start(self, session_metadata):
         print("MusicBot started, joining room...")
+        self.session_metadata = session_metadata
         await self.highrise.join_room(ROOM_ID)
+        # the DJ bot is always dancing, cycling through emotes
+        asyncio.create_task(self._dance_loop())
+
+    async def _dance_loop(self):
+        """DJ bot dances forever, cycling through emotes. Music on or not."""
+        await asyncio.sleep(5)  # let the join settle
+        # the bot dances on itself — get our own user ID from the session
+        try:
+            my_id = self.session_metadata.user_id
+        except Exception:
+            print("dance loop: couldn't find bot user ID, skipping")
+            return
+        print(f"dance loop starting for bot {my_id}")
+        while True:
+            for emote_id, duration in self.DANCE_EMOTES:
+                try:
+                    await self.highrise.send_emote(emote_id, my_id)
+                except Exception as e:
+                    print(f"dance emote {emote_id} failed: {e}")
+                await asyncio.sleep(duration)
 
     async def on_chat(self, user: User, message: str):
         msg = message.strip()
