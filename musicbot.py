@@ -3,7 +3,7 @@
 Commands:
     !play <song name> <artist> — search YouTube and queue (needs sub or VIP)
     !playlist — play random song from oli's playlist (needs sub or VIP)
-    !sub — your sub status + song prices (tip the bot gold for songs)
+    !sub — subscribe (required to play music)
     !q — queue (whispered to you)
     !np — now playing (whispered to you)
     !like / !dislike — vote on the song playing
@@ -142,6 +142,7 @@ class MusicBot(BaseBot):
         self.bot_id = None
         self.credits: dict[str, int] = {}   # user_id -> song credits
         self.vip_users: set[str] = {OLI_ID}  # synced from emote bot's VIP list
+        self.subscribers: set[str] = set()  # users who typed !sub (required to play)
 
     # DJ bot dance emotes — always dancing, cycling through, music on or not
     # (emote_id, duration_seconds)
@@ -165,6 +166,7 @@ class MusicBot(BaseBot):
         self.session_metadata = session_metadata
         self.bot_id = session_metadata.user_id
         self._load_credits()
+        self._load_subscribers()
         await self._refresh_remote_data(first=True)
         # keep the emote-bot VIP list fresh (poll the data branch)
         asyncio.create_task(self._data_sync_loop())
@@ -192,6 +194,23 @@ class MusicBot(BaseBot):
                 json.dump(self.credits, f)
         except Exception as e:
             print(f"[sub] save credits failed: {e}", flush=True)
+
+    def _subs_path(self):
+        return BOT_DIR / "subscribers.json"
+
+    def _load_subscribers(self):
+        try:
+            with open(self._subs_path()) as f:
+                self.subscribers = set(json.load(f))
+        except Exception:
+            self.subscribers = set()
+
+    def _save_subscribers(self):
+        try:
+            with open(self._subs_path(), "w") as f:
+                json.dump(sorted(self.subscribers), f)
+        except Exception as e:
+            print(f"[sub] save subscribers failed: {e}", flush=True)
 
     def _is_vip(self, user_id: str) -> bool:
         return user_id == OLI_ID or user_id in self.vip_users
@@ -236,13 +255,15 @@ class MusicBot(BaseBot):
 
     def _play_allowed(self, user: User):
         """Returns (ok, whisper_message)."""
+        if user.id not in self.subscribers and user.id != OLI_ID:
+            return False, "type !sub to play music"
         if self._is_vip(user.id):
             return True, ""
         queued = sum(1 for s in self.queue if s.get("requested_by") == user.id)
         if queued >= MAX_QUEUE_PER_USER:
             return False, "u already have 2 songs queued — wait for one to play"
         if self.credits.get(user.id, 0) <= 0:
-            return False, "u need a sub to play music — type !sub for prices"
+            return False, "ur out of songs — tip the bot gold for more"
         return True, ""
 
     def _spend_credit(self, user: User):
@@ -280,18 +301,21 @@ class MusicBot(BaseBot):
             print(f"[sub] on_tip error: {e}", flush=True)
 
     async def _cmd_sub(self, user: User):
-        if self._is_vip(user.id):
+        # !sub subscribes you — the only way to be able to play music.
+        # (VIPs play free, everyone else uses song credits from tips.)
+        if user.id in self.subscribers:
+            n = self.credits.get(user.id, 0)
             await self.highrise.send_whisper(
-                user.id, "ur VIP — unlimited plays 🎶")
+                user.id, f"ur already subbed 🎶 ({n} song{'s' if n != 1 else ''} left)")
             return
-        n = self.credits.get(user.id, 0)
+        self.subscribers.add(user.id)
+        self._save_subscribers()
+        print(f"[sub] new subscriber: {getattr(user, 'username', user.id)}", flush=True)
         await self.highrise.send_whisper(
             user.id,
-            f"ur sub: {n} song{'s' if n != 1 else ''} left\n"
-            "tip the bot gold for more songs:\n"
+            "ur subbed! 🎶 tip the bot gold for songs:\n"
             "5g = 5 songs · 10g = 10 songs · "
-            "50g = 50 songs · 100g = 100 songs\n"
-            "VIPs (500g to the emote bot) play free")
+            "50g = 50 songs · 100g = 100 songs")
 
     async def _cmd_vote(self, user: User, kind: str):
         if not self.current:
