@@ -128,6 +128,44 @@ async def yt_search(query: str) -> dict | None:
         return None
 
 
+async def audius_search(query: str) -> dict | None:
+    """Search Audius (free, legal, works from datacenters) for a track.
+    Returns a song dict with a direct stream URL — no download needed."""
+    import urllib.request
+    import urllib.parse
+
+    def _search():
+        try:
+            q = urllib.parse.quote(query)
+            url = (f"https://discoveryprovider.audius.co/v1/tracks/search"
+                   f"?query={q}&app_name=olibottest&limit=5")
+            req = urllib.request.Request(url, headers={"User-Agent": "oli-music-bot/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            tracks = data.get("data", [])
+            for t in tracks:
+                # skip super short or super long tracks
+                dur = t.get("duration", 0) or 0
+                if dur < 30 or dur > 600:
+                    continue
+                tid = t.get("id")
+                title = t.get("title", "Unknown")
+                artist = (t.get("user") or {}).get("name", "")
+                stream_url = (f"https://discoveryprovider.audius.co/v1/tracks/{tid}"
+                              f"/stream?app_name=olibottest")
+                display = f"{title} - {artist}" if artist else title
+                return {"title": display, "url": stream_url, "duration": dur,
+                        "audius": True}
+        except Exception as e:
+            print(f"Audius search failed for '{query}': {e}", flush=True)
+        return None
+    try:
+        return await asyncio.to_thread(_search)
+    except Exception as e:
+        print(f"Audius thread exception: {e}", flush=True)
+        return None
+
+
 class MusicBot(BaseBot):
     # DJ booth spot in Stargazing — the bot walks/teleports here on startup
     # (same spot as bot1's "dj" teleport)
@@ -446,6 +484,9 @@ class MusicBot(BaseBot):
             # fallback to live search (likely blocked on Railway, but try)
             song = await yt_search(query)
         if not song:
+            # Audius: free, legal, works from servers — not mainstream, but plays
+            song = await audius_search(query)
+        if not song:
             await self.highrise.send_whisper(user.id, "couldn't find that song 😢")
             return
         song = dict(song)  # copy — never mutate the shared SONG_URLS dicts
@@ -622,6 +663,37 @@ class MusicBot(BaseBot):
             else:
                 print(f"[audio] local file not found: {filepath}", flush=True)
                 await _whisper_err(f"file not found on server: {local_file}")
+
+        # Audius: direct stream URL, fetch via HTTP (no yt-dlp needed)
+        if song.get("audius"):
+            url = song["url"]
+            print(f"[audio] audius direct fetch: {url[:80]}", flush=True)
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                        if resp.status != 200:
+                            await _whisper_err(f"audius returned {resp.status}")
+                            return 0
+                        audio_data = await resp.read()
+                print(f"[audio] got {len(audio_data)} bytes from audius", flush=True)
+                # PUT to relay (transcode if needed — relay accepts MP3)
+                # Audius streams are usually MP3 or can be played as-is
+                duration = song.get("duration", 180)
+                async with aiohttp.ClientSession() as session:
+                    async with session.put(
+                        RELAY_URL,
+                        data=audio_data,
+                        headers={"Content-Type": "audio/mpeg"}
+                    ) as resp:
+                        print(f"[audio] relay PUT status: {resp.status}", flush=True)
+                        if resp.status != 200:
+                            await _whisper_err(f"relay returned {resp.status}")
+                return duration
+            except Exception as e:
+                print(f"[audio] audius fetch error: {e}", flush=True)
+                await _whisper_err(f"audius failed: {e}")
+                return 0
 
         # Fallback: Download via yt-dlp (YouTube)
         url = song["url"]
