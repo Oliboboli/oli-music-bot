@@ -7,6 +7,7 @@ Commands:
     !np — now playing
     !skip — skip (mods/oli)
     !stop — stop (mods/oli)
+    !summonbot — bring the Stargazing emote bot back if it's gone (oli only)
 """
 
 import asyncio
@@ -25,6 +26,15 @@ BOT_DIR = Path(__file__).parent
 ROOM_ID = os.environ.get("ROOM_ID", "6a7537ddf1acd9746a2593bb")
 RELAY_URL = os.environ.get("RELAY_URL", "https://responsible-vision-production-9695.up.railway.app/stream")
 OLI_ID = "67a4b9fcaa2fc29f791c24f5"
+
+# --- !summonbot: ask local bot2 to restart bot1 ---
+# The DJ bot runs on Railway and can't touch the local bot1 process, so on
+# !summonbot it whispers a signed summon to bot2 (FACbot, local, always
+# connected). Bot2 validates the secret and kills bot1's process; bot1's
+# watchdog restarts it and it rejoins the room within seconds.
+# Must match bot2's SUMMON_SECRET.
+BOT2_USER_ID = "6aba84c6508d4d5a769b6146"
+SUMMON_SECRET = "1af77ba36396001d52e7e20cf8249a65"
 
 # Local MP3s (in repo) — bypass YouTube entirely
 LOCAL_SONGS = {
@@ -132,6 +142,8 @@ class MusicBot(BaseBot):
             await self._cmd_skip(user)
         elif low == "!stop":
             await self._cmd_stop(user)
+        elif low == "!summonbot":
+            await self._cmd_summonbot(user)
 
     async def _cmd_play(self, user: User, query: str):
         # Check local MP3s first (bypasses YouTube)
@@ -219,6 +231,21 @@ class MusicBot(BaseBot):
         self.current = None
         self.playing = False
         await self.highrise.chat("⏹ stopped")
+
+    async def _cmd_summonbot(self, user: User):
+        # Oli only: bring the Stargazing emote bot (bot1) back if it vanished.
+        # Whispers a signed summon to bot2 (local, always connected); bot2
+        # restarts bot1's process and its watchdog rejoins the room.
+        if user.id != OLI_ID:
+            return
+        import time as _time
+        msg = f"summon_bot1:{_time.time()}:{SUMMON_SECRET}"
+        try:
+            await self.highrise.send_whisper(BOT2_USER_ID, msg)
+            await self.highrise.chat("summoning the emote bot back 🫶")
+        except Exception:
+            await self.highrise.send_whisper(
+                user.id, "summon signal failed 😢 try again in a bit")
 
     async def _play_loop(self):
         if self.playing:
