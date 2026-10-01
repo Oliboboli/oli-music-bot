@@ -1,13 +1,19 @@
 """Highrise music bot for Railway — stable internet, no proxy needed.
 
 Commands:
-    !play <song name> <artist> — search YouTube and queue
-    !playlist — play random song from oli's playlist
-    !q — show queue
-    !np — now playing
+    !play <song name> <artist> — search YouTube and queue (needs sub or VIP)
+    !playlist — play random song from oli's playlist (needs sub or VIP)
+    !sub — your sub status + song prices (tip the bot gold for songs)
+    !q — queue (whispered to you)
+    !np — now playing (whispered to you)
+    !like / !dislike — vote on the song playing
     !skip — skip (mods/oli)
     !stop — stop (mods/oli)
     !summonbot — bring the Stargazing emote bot back if it's gone (oli only)
+
+Pay-to-play: non-VIPs tip the bot gold for song credits
+(5g=5 songs, 10g=10, 50g=50, 100g=100). VIPs (500g to the emote bot)
+play free. Max 2 queued songs per player.
 """
 
 import asyncio
@@ -35,6 +41,14 @@ OLI_ID = "67a4b9fcaa2fc29f791c24f5"
 # Must match bot2's SUMMON_SECRET.
 BOT2_USER_ID = "6aba84c6508d4d5a769b6146"
 SUMMON_SECRET = "1af77ba36396001d52e7e20cf8249a65"
+
+# --- Pay-to-play (!sub) ---
+# Non-VIPs tip the bot gold -> song credits. VIP status comes from the
+# emote bot's VIP list (500g tippers), synced via the repo's "data" branch.
+# Max 2 queued songs per player at a time.
+SONG_TIERS = [(100, 100), (50, 50), (10, 10), (5, 5)]  # (gold, songs)
+MAX_QUEUE_PER_USER = 2
+DATA_RAW = "https://raw.githubusercontent.com/Oliboboli/oli-music-bot/data"
 
 # Local MP3s (in repo) — bypass YouTube entirely
 LOCAL_SONGS = {
@@ -125,6 +139,9 @@ class MusicBot(BaseBot):
         self.queue = deque()
         self.current = None
         self.playing = False
+        self.bot_id = None
+        self.credits: dict[str, int] = {}   # user_id -> song credits
+        self.vip_users: set[str] = {OLI_ID}  # synced from emote bot's VIP list
 
     # DJ bot dance emotes — always dancing, cycling through, music on or not
     # (emote_id, duration_seconds)
@@ -146,11 +163,155 @@ class MusicBot(BaseBot):
     async def on_start(self, session_metadata):
         print("MusicBot started, joining room...")
         self.session_metadata = session_metadata
+        self.bot_id = session_metadata.user_id
+        self._load_credits()
+        await self._refresh_remote_data(first=True)
+        # keep the emote-bot VIP list fresh (poll the data branch)
+        asyncio.create_task(self._data_sync_loop())
         await self.highrise.join_room(ROOM_ID)
         # head to the DJ booth automatically, then start dancing
         asyncio.create_task(self._go_to_dj_booth())
         # the DJ bot is always dancing, cycling through emotes
         asyncio.create_task(self._dance_loop())
+
+    # ---------- pay-to-play (!sub) ----------
+
+    def _credits_path(self):
+        return BOT_DIR / "credits.json"
+
+    def _load_credits(self):
+        try:
+            with open(self._credits_path()) as f:
+                self.credits = {k: int(v) for k, v in json.load(f).items()}
+        except Exception:
+            self.credits = {}
+
+    def _save_credits(self):
+        try:
+            with open(self._credits_path(), "w") as f:
+                json.dump(self.credits, f)
+        except Exception as e:
+            print(f"[sub] save credits failed: {e}", flush=True)
+
+    def _is_vip(self, user_id: str) -> bool:
+        return user_id == OLI_ID or user_id in self.vip_users
+
+    async def _refresh_remote_data(self, first: bool = False):
+        """Pull vip.json (always) and credits.json (startup only) from the
+        repo's data branch. The emote bot pushes vip.json there on change."""
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get(f"{DATA_RAW}/vip.json",
+                                           timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        if r.status == 200:
+                            self.vip_users = set(await r.json()) | {OLI_ID}
+                except Exception as e:
+                    print(f"[sub] vip refresh failed: {e}", flush=True)
+                if first:
+                    try:
+                        async with session.get(
+                                f"{DATA_RAW}/credits.json",
+                                timeout=aiohttp.ClientTimeout(total=15)) as r:
+                            if r.status == 200:
+                                data = await r.json()
+                                for uid, n in data.items():
+                                    self.credits[uid] = max(
+                                        self.credits.get(uid, 0), int(n))
+                                self._save_credits()
+                    except Exception as e:
+                        print(f"[sub] credits refresh failed: {e}", flush=True)
+        except Exception as e:
+            print(f"[sub] remote data failed: {e}", flush=True)
+
+    async def _data_sync_loop(self):
+        await asyncio.sleep(10)
+        while True:
+            try:
+                await self._refresh_remote_data()
+            except Exception:
+                pass
+            await asyncio.sleep(300)  # refresh VIP list every 5 min
+
+    def _play_allowed(self, user: User):
+        """Returns (ok, whisper_message)."""
+        if self._is_vip(user.id):
+            return True, ""
+        queued = sum(1 for s in self.queue if s.get("requested_by") == user.id)
+        if queued >= MAX_QUEUE_PER_USER:
+            return False, "u already have 2 songs queued — wait for one to play"
+        if self.credits.get(user.id, 0) <= 0:
+            return False, "u need a sub to play music — type !sub for prices"
+        return True, ""
+
+    def _spend_credit(self, user: User):
+        if not self._is_vip(user.id):
+            self.credits[user.id] = max(0, self.credits.get(user.id, 0) - 1)
+            self._save_credits()
+
+    async def on_tip(self, sender, receiver, tip) -> None:
+        # gold tip to the bot = song credits (5g=5, 10g=10, 50g=50, 100g=100)
+        try:
+            if not self.bot_id or receiver.id != self.bot_id:
+                return
+            if getattr(tip, "type", "") != "gold":
+                return
+            amount = int(getattr(tip, "amount", 0) or 0)
+            songs = 0
+            for gold, s in SONG_TIERS:
+                if amount >= gold:
+                    songs = s
+                    break
+            if songs <= 0:
+                return
+            self.credits[sender.id] = self.credits.get(sender.id, 0) + songs
+            self._save_credits()
+            print(f"[sub] {getattr(sender, 'username', sender.id)} tipped "
+                  f"{amount}g -> +{songs} songs "
+                  f"(total {self.credits[sender.id]})", flush=True)
+            try:
+                await self.highrise.send_whisper(
+                    sender.id,
+                    f"+{songs} songs! u now have {self.credits[sender.id]} 🎶")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[sub] on_tip error: {e}", flush=True)
+
+    async def _cmd_sub(self, user: User):
+        if self._is_vip(user.id):
+            await self.highrise.send_whisper(
+                user.id, "ur VIP — unlimited plays 🎶")
+            return
+        n = self.credits.get(user.id, 0)
+        await self.highrise.send_whisper(
+            user.id,
+            f"ur sub: {n} song{'s' if n != 1 else ''} left\n"
+            "tip the bot gold for more songs:\n"
+            "5g = 5 songs · 10g = 10 songs · "
+            "50g = 50 songs · 100g = 100 songs\n"
+            "VIPs (500g to the emote bot) play free")
+
+    async def _cmd_vote(self, user: User, kind: str):
+        if not self.current:
+            await self.highrise.send_whisper(user.id, "nothing playing rn")
+            return
+        song = self.current
+        likes = song.setdefault("likes", set())
+        dislikes = song.setdefault("dislikes", set())
+        if kind == "like":
+            dislikes.discard(user.id)
+            likes.add(user.id)
+        else:
+            likes.discard(user.id)
+            dislikes.add(user.id)
+        await self.highrise.send_whisper(
+            user.id,
+            f"{'👍' if kind == 'like' else '👎'} {song['title']} "
+            f"({len(likes)} 👍 / {len(dislikes)} 👎)")
+
+    # ---------- /pay-to-play ----------
 
     async def _go_to_dj_booth(self):
         """Walk/teleport to the DJ booth on startup, return if moved."""
@@ -226,6 +387,12 @@ class MusicBot(BaseBot):
             await self._cmd_queue(user)
         elif low == "!np":
             await self._cmd_np(user)
+        elif low == "!sub":
+            await self._cmd_sub(user)
+        elif low == "!like":
+            await self._cmd_vote(user, "like")
+        elif low == "!dislike":
+            await self._cmd_vote(user, "dislike")
         elif low == "!skip":
             await self._cmd_skip(user)
         elif low == "!stop":
@@ -234,11 +401,17 @@ class MusicBot(BaseBot):
             await self._cmd_summonbot(user)
 
     async def _cmd_play(self, user: User, query: str):
+        ok, msg = self._play_allowed(user)
+        if not ok:
+            await self.highrise.send_whisper(user.id, msg)
+            return
         # Check local MP3s first (bypasses YouTube)
         qlow = query.lower().strip()
         for key, filename in LOCAL_SONGS.items():
             if key in qlow or qlow in key:
-                song = {"title": key.title(), "local_file": filename, "url": "", "requested_by": user.id}
+                song = {"title": key.title(), "local_file": filename, "url": "",
+                        "requested_by": user.id, "likes": set(), "dislikes": set()}
+                self._spend_credit(user)
                 self.queue.append(song)
                 await self.highrise.send_whisper(user.id, f"queued: {song['title']}")
                 if not self.playing:
@@ -251,6 +424,11 @@ class MusicBot(BaseBot):
         if not song:
             await self.highrise.send_whisper(user.id, "couldn't find that song 😢")
             return
+        song = dict(song)  # copy — never mutate the shared SONG_URLS dicts
+        song["requested_by"] = user.id
+        song.setdefault("likes", set())
+        song.setdefault("dislikes", set())
+        self._spend_credit(user)
         self.queue.append(song)
         await self.highrise.send_whisper(
             user.id, f"queued: {song['title']}"
@@ -259,6 +437,10 @@ class MusicBot(BaseBot):
             asyncio.create_task(self._play_loop())
 
     async def _cmd_playlist(self, user: User):
+        ok, msg = self._play_allowed(user)
+        if not ok:
+            await self.highrise.send_whisper(user.id, msg)
+            return
         if not PLAYLIST:
             await self.highrise.send_whisper(user.id, "playlist is empty 😢")
             return
@@ -271,6 +453,11 @@ class MusicBot(BaseBot):
         if not song:
             await self.highrise.send_whisper(user.id, "couldn't find that song 😢")
             return
+        song = dict(song)
+        song["requested_by"] = user.id
+        song.setdefault("likes", set())
+        song.setdefault("dislikes", set())
+        self._spend_credit(user)
         self.queue.append(song)
         if not self.playing:
             asyncio.create_task(self._play_loop())
@@ -288,7 +475,11 @@ class MusicBot(BaseBot):
 
     async def _cmd_np(self, user: User):
         if self.current:
-            await self.highrise.send_whisper(user.id, f"🎵 {self.current['title']}")
+            likes = len(self.current.get("likes", ()))
+            dislikes = len(self.current.get("dislikes", ()))
+            votes = f" ({likes} 👍 / {dislikes} 👎)" if (likes or dislikes) else ""
+            await self.highrise.send_whisper(
+                user.id, f"🎵 {self.current['title']}{votes}")
         else:
             await self.highrise.send_whisper(user.id, "nothing playing")
 
