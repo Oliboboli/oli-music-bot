@@ -20,7 +20,7 @@ from collections import deque
 from pathlib import Path
 
 from highrise import BaseBot, Highrise
-from highrise.models import User
+from highrise.models import Position, User
 
 BOT_DIR = Path(__file__).parent
 ROOM_ID = os.environ.get("ROOM_ID", "6a7537ddf1acd9746a2593bb")
@@ -115,6 +115,11 @@ async def yt_search(query: str) -> dict | None:
 
 
 class MusicBot(BaseBot):
+    # DJ booth spot in Stargazing — the bot walks/teleports here on startup
+    # (same spot as bot1's "dj" teleport)
+    DJ_BOOTH = {"x": 11.142864227295, "y": 0.25, "z": 29.183265686035,
+                "facing": "FrontRight"}
+
     def __init__(self):
         super().__init__()
         self.queue = deque()
@@ -142,8 +147,53 @@ class MusicBot(BaseBot):
         print("MusicBot started, joining room...")
         self.session_metadata = session_metadata
         await self.highrise.join_room(ROOM_ID)
+        # head to the DJ booth automatically, then start dancing
+        asyncio.create_task(self._go_to_dj_booth())
         # the DJ bot is always dancing, cycling through emotes
         asyncio.create_task(self._dance_loop())
+
+    async def _go_to_dj_booth(self):
+        """Walk/teleport to the DJ booth on startup, return if moved."""
+        await asyncio.sleep(8)  # let the join settle
+        try:
+            my_id = self.session_metadata.user_id
+        except Exception:
+            print("dj booth: couldn't find bot user ID, skipping")
+            return
+        for _ in range(3):
+            try:
+                try:
+                    await self.highrise.teleport(my_id, Position(**self.DJ_BOOTH))
+                except Exception:
+                    await self.highrise.walk_to(Position(**self.DJ_BOOTH))
+                print("dj booth: bot is at the booth")
+                break
+            except Exception as e:
+                print(f"dj booth: move failed ({e}), retrying")
+                await asyncio.sleep(5)
+        # stay at the booth — go back if anything moves the bot
+        while True:
+            try:
+                await asyncio.sleep(30)
+                resp = await self.highrise.get_room_users()
+                from highrise.models import Error
+                if isinstance(resp, Error):
+                    continue
+                positions = {u.id: pos for u, pos in resp.content}
+                if my_id not in positions:
+                    continue
+                pos = positions[my_id]
+                if not hasattr(pos, "x"):
+                    continue
+                dx = pos.x - self.DJ_BOOTH["x"]
+                dz = pos.z - self.DJ_BOOTH["z"]
+                if dx * dx + dz * dz > 4.0:  # moved more than ~2m away
+                    try:
+                        await self.highrise.teleport(my_id, Position(**self.DJ_BOOTH))
+                    except Exception:
+                        await self.highrise.walk_to(Position(**self.DJ_BOOTH))
+            except Exception:
+                pass
 
     async def _dance_loop(self):
         """DJ bot dances forever, cycling through emotes. Music on or not."""
