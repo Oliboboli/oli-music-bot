@@ -26,7 +26,35 @@ from collections import deque
 from pathlib import Path
 
 from highrise import BaseBot, Highrise
-from highrise.models import Position, User
+from highrise.models import Error, Position, User
+
+# Patch the SDK: _do_req_no_resp waits forever for a server response.
+# If the server goes quiet, the bot hangs. Add a 15s timeout so
+# background tasks fail fast instead of freezing the bot.
+try:
+    import highrise as _hr_sdk
+    _orig_do_req = _hr_sdk._do_req_no_resp
+
+    async def _do_req_no_resp_timeout(hr, req):
+        import asyncio as _aio
+        rid = str(next(hr._req_id))
+        req.rid = rid
+        from asyncio import Queue as _Q
+        hr._req_id_registry[rid] = (q := _Q(maxsize=1))
+        await hr.ws.send_str(_hr_sdk.converter.dumps(req, _hr_sdk.Outgoing))
+        try:
+            resp = await _aio.wait_for(q.get(), timeout=15)
+        except _aio.TimeoutError:
+            hr._req_id_registry.pop(rid, None)
+            raise TimeoutError("highrise request timed out (no server response)")
+        from highrise.models import Error as _Err
+        if isinstance(resp, _Err):
+            raise _hr_sdk.ResponseError(resp.message)
+
+    _hr_sdk._do_req_no_resp = _do_req_no_resp_timeout
+    print("SDK patched: request timeout 15s", flush=True)
+except Exception as e:
+    print(f"SDK patch failed: {e!r}", flush=True)
 
 BOT_DIR = Path(__file__).parent
 ROOM_ID = os.environ.get("ROOM_ID", "6a7537ddf1acd9746a2593bb")
@@ -206,13 +234,59 @@ class MusicBot(BaseBot):
         self._load_credits()
         self._load_subscribers()
         await self._refresh_remote_data(first=True)
+        # Cancel any existing tasks first (on_start can fire on reconnect,
+        # and we don't want duplicate loops)
+        for attr in ("_bg_tasks",):
+            old_tasks = getattr(self, attr, None)
+            if old_tasks:
+                for t in old_tasks:
+                    if not t.done():
+                        t.cancel()
+        self._bg_tasks = []
         # keep the emote-bot VIP list fresh (poll the data branch)
-        asyncio.create_task(self._data_sync_loop())
+        self._bg_tasks.append(asyncio.create_task(self._data_sync_loop()))
         await self.highrise.join_room(ROOM_ID)
         # head to the DJ booth automatically, then start dancing
-        asyncio.create_task(self._go_to_dj_booth())
+        self._bg_tasks.append(asyncio.create_task(self._go_to_dj_booth()))
         # the DJ bot is always dancing, cycling through emotes
-        asyncio.create_task(self._dance_loop())
+        self._bg_tasks.append(asyncio.create_task(self._dance_loop()))
+        # self-heal: if the connection goes silent, exit so Railway
+        # restarts the container and we rejoin fresh
+        self._bg_tasks.append(asyncio.create_task(self._connection_watchdog()))
+
+    async def _connection_watchdog(self) -> None:
+        # detect silent disconnects — if API calls stop getting responses,
+        # exit so Railway restarts us fresh. Checks every 30s, exits
+        # after 2 consecutive failures.
+        # NB: get_room_users does NOT reliably list the bot itself, so a
+        # successful response — even with an empty list — means the
+        # connection is alive. Only timeouts/errors count as failures.
+        await asyncio.sleep(30)  # let startup settle
+        failures = 0
+        while True:
+            try:
+                await asyncio.sleep(30)
+                resp = None
+                try:
+                    resp = await asyncio.wait_for(
+                        self.highrise.get_room_users(), timeout=10)
+                except Exception:
+                    pass
+                if resp is None or isinstance(resp, Error):
+                    failures += 1
+                else:
+                    failures = 0
+                if failures >= 2:
+                    print("[conn-watchdog] silent disconnect, exiting for restart",
+                          flush=True)
+                    # give the server a moment to notice we're gone before
+                    # Railway restarts us (avoids ghost sessions)
+                    await asyncio.sleep(5)
+                    os._exit(1)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     # ---------- pay-to-play (!sub) ----------
 
